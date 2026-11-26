@@ -1610,9 +1610,20 @@ class Function:
             return [Item((move & ~(31 << USCHED)) | (w & (31 << USCHED)) | wait, i, 'move')]
         if name in ('ldg__sImmOffset', 'ld__sImmOffset') and ops.get('sp2'):
             # What the load says to the cache about its neighbours: sm_70 has no such thing to say.
-            cleared = self.put(d.c, w, 'sp2', 0)
-            if mc.decode(70, cleared) is not None:
-                return [Item(self.without_batch(name, cleared), i, 'without its cache hint')]
+            return [Item(self.put(d.c, w, 'sp2', 0), i, 'without its cache hint')]
+        if (name == 'ldg__sImmOffset' and mc.decode(70, w) is None
+                and ops.get('e') == 1 and ops.get('sz') in (5, 6)
+                and ops.get('sem') in (0, 1, 2) and ops.get('sco') in (2, 3)
+                and ops.get('cop') == 1):
+            # The Turing table's LTC128B and the like: rebuild the load with sm_70's table, keeping
+            # its data, guard and scoreboards. What changes is the cache hint.
+            target = mc.assemble('ldg__sImmOffset',
+                e=ops.get('e', 1), sz=ops['sz'], sem=ops['sem'], sco=ops['sco'], cop=ops['cop'],
+                Pu=ops.get('Pu', 7), Rd=ops['Rd'], Ra=ops['Ra'], Ra_offset=ops.get('Ra_offset', 0),
+                Pg=ops.get('Pg', 7), Pg_not=ops.get('Pg@not', 0),
+                src_rel_sb=ops.get('src_rel_sb', 7), dst_wr_sb=ops.get('dst_wr_sb', 7))
+            if mc.decode(70, target) is not None:
+                return [Item(target, i, 'without its cache hint')]
         if name in mc.rule_of:
             out = self.rule(d, mc.rule_of[name], i)
             after = mc.decode(70, out)

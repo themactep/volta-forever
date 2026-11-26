@@ -105,6 +105,16 @@ pub(super) fn translate_one(ctx: &mut Ctx, i: usize, d: &Decoded) -> Result<Vec<
             return Ok(vec![Item::new(cleared, i, "without its cache hint", true)]);
         }
     }
+    // 8b. A Turing table with hints that sm_70's does not have (LTC128B and the like). Rebuild
+    // the global load with sm_70's table, keeping its data, guard and scoreboards: what changes
+    // is the cache hint, which is what "without its cache hint" says.
+    if name == "ldg__sImmOffset"
+        && ctx.dec70.decode(w).is_none()
+        && let Some(word) = sm70_ldg_without_hints(d)
+        && ctx.dec70.decode(word).is_some()
+    {
+        return Ok(vec![Item::new(word, i, "without its cache hint", true)]);
+    }
 
     // 9. Rule
     if let Some(target) = rule::rule_of_target(d.class_id) {
@@ -465,4 +475,54 @@ pub(super) fn without_batch(class_name: &str, d: &Decoded, word: u128) -> Result
         return Ok(word);
     }
     put_operand_by_class(class_name, word, table, u64::from(value & 31), false)
+}
+
+/// The same global load as `d`, with the sm_70 cache and scope table. The e, size, weak or
+/// constant state, scope and cop fields are the sm_70 ones; the data, guard and scoreboards are
+/// the instruction's. None for a size or state that this does not know.
+pub(super) fn sm70_ldg_without_hints(d: &Decoded) -> Option<u128> {
+    // The source's e, sem, sco and cop are fields 2, 6, 7 and 4 of the sm_75 class (their names
+    // in `OP_NAMES`); only the values seen in place of a Turing-only table are given here.
+    let e = match d.op_or(2, 255) {
+        1 => "E",
+        _ => return None,
+    };
+    let sz = match d.op_or(OP_SZ, 255) {
+        5 => "_64",
+        6 => "_128",
+        _ => return None,
+    };
+    let sem = match d.op_or(6, 255) {
+        0 => "CONSTANT",
+        1 => "WEAK",
+        2 => "STRONG",
+        _ => return None,
+    };
+    let sco = match d.op_or(7, 255) {
+        2 => "GPU",
+        3 => "SYS",
+        _ => return None,
+    };
+    let cop = match d.op_or(4, 255) {
+        1 => "EN",
+        _ => return None,
+    };
+    assemble::assemble(
+        "ldg__sImmOffset",
+        &[
+            ("e", assemble::OpVal::Str(e)),
+            ("sz", assemble::OpVal::Str(sz)),
+            ("sem", assemble::OpVal::Str(sem)),
+            ("sco", assemble::OpVal::Str(sco)),
+            ("cop", assemble::OpVal::Str(cop)),
+            ("Pu", assemble::OpVal::Int(d.op_or(OP_PU, 7))),
+            ("Rd", assemble::OpVal::Int(d.op_or(OP_RD, 255))),
+            ("Ra", assemble::OpVal::Int(d.op_or(OP_RA, 255))),
+            ("Ra_offset", assemble::OpVal::Int(d.op_or(OP_RA_OFFSET, 0))),
+            ("Pg", assemble::OpVal::Int(d.op_or(OP_PG, 7))),
+            ("Pg_not", assemble::OpVal::Int(d.op_or(OP_PG_AT_NOT, 0))),
+            ("src_rel_sb", assemble::OpVal::Int(d.op_or(OP_SRC_REL_SB, 7))),
+            ("dst_wr_sb", assemble::OpVal::Int(d.op_or(OP_DST_WR_SB, 7))),
+        ],
+    )
 }

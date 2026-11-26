@@ -1819,3 +1819,43 @@ fn the_upper_written_fixture_has_a_pair_its_callee_breaks() {
         register + 1
     );
 }
+
+/// A global load whose sm_75 table has a hint that sm_70 has no field for is rebuilt with sm_70's
+/// table: the data registers, the guard and the scoreboards stay.
+#[test]
+fn a_turing_global_load_gets_the_sm70_cache_and_scope() {
+    let mut dec75 = Decoder::new(75);
+    let mut dec70 = Decoder::new(70);
+    for (word, rd, ra) in [
+        (0x140a2400001e4d240000000082847381u128, 132, 130),
+        (0x1406a200001f4b24000000008a987381u128, 152, 138),
+    ] {
+        let d = dec75.decode(word).expect("sm_75 LDG");
+        assert!(dec70.decode(word).is_none(), "the Turing word is not sm_70");
+        let word70 = super::instruction::sm70_ldg_without_hints(&d).expect("rebuilt");
+        let d70 = dec70.decode(word70).expect("sm_70 LDG");
+        assert_eq!(d70.name, "ldg__sImmOffset");
+        assert_eq!(d70.op_or(crate::generated::fields::OP_RD, 255), rd);
+        assert_eq!(d70.op_or(crate::generated::fields::OP_RA, 255), ra);
+        assert_eq!(
+            d70.op_or(crate::generated::fields::OP_SZ, 255),
+            d.op_or(crate::generated::fields::OP_SZ, 255)
+        );
+        assert_eq!(
+            d70.op_or(crate::generated::fields::OP_SRC_REL_SB, 255),
+            d.op_or(crate::generated::fields::OP_SRC_REL_SB, 255)
+        );
+        assert_eq!(
+            d70.op_or(crate::generated::fields::OP_DST_WR_SB, 255),
+            d.op_or(crate::generated::fields::OP_DST_WR_SB, 255)
+        );
+        assert_eq!(
+            d70.op_or(crate::generated::fields::OP_PG, 255),
+            d.op_or(crate::generated::fields::OP_PG, 255)
+        );
+        assert_eq!(
+            d70.op_or(crate::generated::fields::OP_PG_AT_NOT, 255),
+            d.op_or(crate::generated::fields::OP_PG_AT_NOT, 255)
+        );
+    }
+}
