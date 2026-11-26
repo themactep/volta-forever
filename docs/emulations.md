@@ -817,7 +817,13 @@ products, bf16 and tf32 products, bf16 arithmetic, conversions of FP8/E2M1/UE8M0
 other instructions of section 9: these appear only in PTX and are handled by the PTX
 lowering. Two exceptions come with sm_80 machine code: the 16-byte asynchronous copy from
 global to shared memory becomes a load and a store under its predicate, and the conversion
-of two f32 to f16x2 becomes conversions and a permutation. And two for bfloat16, which vLLM's
+of two f32 to f16x2, `F2FP.PACK_AB`: each f32 is `cvt.rn.f16.f32`, a single rounding to nearest
+even, `Ra` in the high half and `Rb` in the low one. The translation is two `F2F.F16.F32`, the
+high one into a register of the translation, and a `PRMT` (selector `0x5410`) that packs their
+low halves into the destination; `Rd` may be `Rb`. Three instructions for one. The CUDA 13.5
+cuBLAS half GEMM uses it: on a V100 all 65,536 outputs of the probe's GEMM are the CPU
+reference's, and the same probe run natively on an RTX 3060 (where the F2FP is the hardware's)
+gives the same (`runtime-13.5-ptx` of `tests/gpu/run.sh`). And two for bfloat16, which vLLM's
 vectorized bf16 norm uses (2026-11-25):
 
 - `HFMA2.BF16_V2 Rd, Ra, 1, 1, Rc`, what NVIDIA's assembler makes of `fma.rn.bf16x2` with a

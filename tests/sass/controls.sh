@@ -27,7 +27,10 @@
 # validator). The exit status is 1 when the translation as it is has a problem somewhere, when a
 # control changes the translation of a cubin and is not objected to there (a hole in the
 # validator, or a control that tests nothing there), or when the validator stopped without a
-# verdict. Apart: the controls of CHANGES_THE_PROGRAM in reference/controls.py (no objection is no
+# verdict. Not in these passes: reference/controls.py's HALF_CONTROLS (F2FP and Turing zero-fill
+# loads), which no cubin of the repository has; they are run by name on a cubin that has one
+# (`-c`). LEPC_CONTROLS runs in these passes (k_lepc.sm75.cubin carries the pair). Apart: the
+# controls of CHANGES_THE_PROGRAM in reference/controls.py (no objection is no
 # hole), and the cases of RIGHT_THERE there, where what a control changed stays right, each looked
 # at (reference/controls.py decides a cubin's verdict for both: unobjected()). (Until 2026-11-23 a control had to be objected to in one cubin only: the validator could
 # have lost the objection in all others unnoticed.) A cubin whose translation as it is has

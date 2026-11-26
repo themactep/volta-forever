@@ -4,6 +4,20 @@
 
 ### Fixed
 
+- The CUDA 13.5 cuBLAS half GEMM runs on a V100 without the CUDA 12.9 forwarder: the kernel
+  cuBLAS selects (`turing_fp16_s1688gemm_fp16_128x256_ldg8_relu_f2f_stages_32x1_nn`) translates
+  and runs, and all 65,536 outputs of the probe's 256×256 GEMM are the CPU reference's
+  (`tests/gpu/run.sh`, `runtime-13.5-ptx`); an RTX 3060 run of the same probe, natively, gives
+  the same. Turing's zero-fill loads (`Pnz`) become a load under the predicate and `RZ` moves
+  under its complement; `F2FP.PACK_AB` (two f32 to two f16 in one register, which the sm_75
+  description has and NVIDIA's disassembler prints for SM80 only) becomes two `F2F.F16.F32` and
+  a `PRMT`; the sm_75 cache/scope table of a rebuilt load is sm_70's, and a changed load names
+  no batch. A kernel entered from outside may use the registers above the ones it names when
+  level 3 would otherwise refuse it, and a kernel that does not use R1 gets its frame from the
+  top of the thread's local memory. The independent validator learned the F2FP and zero-fill
+  sequences, the return address of a `LEPC` call, and that `BRA.U`'s `cond=1` is the uniform
+  modifier, not a condition. Six `turing_fp16_s1688gemm` 128x128 variants and the image's
+  CUTLASS GELU kernels (for `MUFU`) are still refused (`LIMITS.md`, "Kernels refused").
 - A direct call whose return address is the program counter read by a `LEPC` immediately before
   it (cuDNN 9.24's sm_75 kernels give direct calls so: `LEPC R128; CALL.REL`) was refused with
   `LEPC ... without a call after it`. It is translated now: the `LEPC` and the call move with the

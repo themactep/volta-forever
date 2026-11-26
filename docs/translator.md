@@ -128,7 +128,7 @@ What sm_75 has and sm_70 lacks:
 | Memory at `[register * 4, 8 or 16]` in shared memory | 0.5 % | `SHF.L` of the register into a kept copy, then the plain address form |
 | `IMNMX` (integer minimum and maximum) | 0.12 % | `ISETP` into a dead predicate, then `SEL` |
 | Turing's tensor-core instructions (`HMMA.1688`, `LDSM`) | 0.02 % | Volta's own products (`HMMA.884`) and shuffles; see section 6 |
-| A cache hint on loads (`LDG.E.LTC128B`) | 0.02 % | The hint is dropped |
+| A cache hint on loads (`LDG.E.LTC128B`) | 0.02 % | The load is rebuilt with sm_70's table, so the hint is dropped; a zero-fill predicate (`Pnz`) is kept (section 2) |
 
 The shares are of all the instructions of PyTorch's 475 cubins (by nvdisasm's
 text of each word that is no sm_70 instruction; an instruction with a uniform
@@ -203,6 +203,17 @@ for that operand, then the load or store at the plain address `[Rk + 0x10]`.
 A `ULDC` (load from the constant bank into a uniform register) becomes one or
 two `MOV` from the same constant bank entry into the ordinary register that
 stands for it.
+
+A Turing global or local load (`LDG`, `LD`) carries a cache and scope table that
+sm_70 has no field for (`LTC128B` and the like). It is rebuilt with sm_70's table
+(the extended address, size, weak or constant state, scope and cop), its data,
+guard and scoreboards unchanged, and the batch part of its scheduling table
+cleared: an instruction the translation changed names no batch (the wait hint
+stays). A load that names `Pnz`, Turing's zero-fill predicate, is done where the
+predicate holds, and its destinations are set to zero under its complement:
+`@Pnz LDG` and `@!Pnz MOV R, RZ` for each destination, which is what ptxas writes
+for the same construct on Volta itself. A load with both an instruction guard and
+a `Pnz` is refused: sm_70 has one predicate per instruction.
 
 
 ## 3. The instruction tables
@@ -493,19 +504,31 @@ stops vLLM; FlashInfer's attention kernels at 246 to 248 registers):
   own: the kernel attributes that say how far under the stack pointer the
   thread may go are raised by its size, and the stack pointer is lowered by it
   after the first instruction (which must be the one that sets R1 from
-  `c[0x0][0x28]`).
+  `c[0x0][0x28]`). A kernel that does not use R1 at all needs none of that: its
+  frame is addressed from `c[0x0][0x28]`, loaded into a register of the
+  translation at each instruction that reads or writes it, and the stack pointer
+  is not lowered. Room is made only in the first form: what is put away and
+  brought back is addressed from the stack pointer.
 - The pool, the base register, and the scratch registers of a tensor-core
   sequence are taken among the program's registers that hold nothing at that
   instruction.
 - The lane is read where it is used: an `S2R` on a scoreboard before the
   sequence, waited for.
 
-Level 3 adds no registers. Tried first on every kernel of PyTorch (an
+Level 3 adds no registers of its own. Tried first on every kernel of PyTorch (an
 experiment, `VF_BORROW=3`), 16,052 of the 23,630 kernels that translate alone
 kept their own register count (15,950 exactly, 102 with one or two more for
 saved predicates), 5,577 of them with uniform registers in memory. The default
 uses it only for a kernel that would otherwise be refused: it is the slowest
 code.
+
+A kernel that is entered from outside and is refused at level 3 for want of
+registers may take the registers above the ones the program names, up to R252:
+no caller keeps values there. That is a second level-3 attempt, made only after
+the first is refused, so a kernel that fits in its own registers keeps its layout
+and its count; it is not made for a kernel that declares its block size, whose
+CTA is preserved. The section's register count follows the highest register
+taken.
 
 
 ### Room

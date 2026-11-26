@@ -309,6 +309,17 @@ module whole, with one copy of each variable, and gives every table. Neither Str
 V100s (issue #3) nor any case of `tests/gpu/run.sh` but those that test this asked for such a
 table (2026-11-23).
 
+**cuBLAS 13.5's half kernels for sm_75.** The CUDA 13.5 cuBLAS half GEMM runs on a V100: the
+kernel cuBLAS selects for a 256×256 NN product
+(`turing_fp16_s1688gemm_fp16_128x256_ldg8_relu_f2f_stages_32x1_nn`) translates, and all 65,536
+outputs are the CPU reference's (`tests/gpu/run.sh`, `runtime-13.5-ptx`). Six of the image's 100
+kernels are refused: the `128x128` variants of
+`turing_fp16_s1688gemm_fp16_128x128_ldg8_{f2f,relu_f2f}_{nn,tn,tt}`, whose level-3 translation
+finds no 8 registers in a row for a matrix load even with those above the program's own. cuBLAS
+did not ask for them for the tested shapes; another shape may. Two CUTLASS GELU kernels of the
+same image (`cutlass_75_tensorop_f16_s1688gemm_gelu_f16_64x64_nn_align8` and its `dgelu`) are
+refused for `MUFU` (`no translation for mufu__RRR_RR`); the GEMM does not use them.
+
 ## Kernels launched from a second translation
 
 A kernel compiled for blocks of 1,024 threads may have 64 registers at most on a V100, and the
@@ -524,6 +535,7 @@ runs emulated instructions is announced on standard error.
 | FP8 products | exact conversion to halves, then Volta's products | as FP16 products | |
 | Block-scaled products (NVFP4, MXFP4, MXF8F6F4) | each block through Volta's products, the scales applied after | NVFP4: of 406,912 results compared with an RTX 5090's, 405,861 identical, 1,051 one unit of the last place away, none further. The other forms agree less (`docs/emulations.md`, "Block-scaled products") | 2.7 times a kernel written by hand |
 | Conversions of bf16, tf32, FP8, E2M1, UE8M0 | bit manipulation | every value of the small formats gives what an RTX 5090 gives, byte for byte | |
+| `F2FP.PACK_AB` (two f32 to two f16 in one register) | two `F2F.F16.F32` and a `PRMT` | each half is the single rounding to nearest even that the hardware's `F2F.F16.F32` gives; the CUDA 13.5 half GEMM's 65,536 outputs are the CPU's, on a V100 and on an RTX 3060's own cuBLAS | one conversion and a pack: three instructions for one |
 | bf16 arithmetic and atomic additions | `fma`; a compare-and-swap loop | | |
 | `cp.async`, 256-bit loads | plain loads | | |
 
