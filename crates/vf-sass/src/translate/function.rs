@@ -90,6 +90,9 @@ pub(super) fn translate_function(
 
     let frame = ctx.borrow.as_ref().map_or(0, |b| b.frame_bytes);
     let has_room = ctx.borrow.as_ref().is_some_and(|b| b.room);
+    // A frame addressed from the stack pointer (it is moved under the frame at the start); or
+    // from the top of the thread's local memory, loaded at each instruction that reads it.
+    let from_r1 = ctx.borrow.as_ref().is_some_and(|b| b.from_r1);
     let mut items: Vec<Item> = Vec::new();
     let mut targets: Vec<u64> = Vec::new();
     for (i, d) in fd.src.iter().enumerate() {
@@ -102,8 +105,8 @@ pub(super) fn translate_function(
         } else if stack_top(d) && ctx.top_again.is_none() {
             ctx.top_again = Some(i);
         }
-        // Level 3: check the stack pointer.
-        if frame > 0 {
+        // Level 3: check the stack pointer, where the frame is addressed from it.
+        if frame > 0 && from_r1 {
             if i == 0 {
                 // The first instruction must set R1 from c[0x0][0x28] unguarded.
                 if !ctx.entry_sets_r1 {
@@ -282,7 +285,7 @@ pub(super) fn translate_function(
         // within the section counts from there), and a branch to offset 0 reads the lane again.
         // Level 3: the stack pointer starts under the frame. With room to be made, how large
         // the frame is is known at the end: `lower_item_idx`.
-        if i == 0 && (frame > 0 || (has_room && ctx.entry_sets_r1)) {
+        if i == 0 && from_r1 && (frame > 0 || (has_room && ctx.entry_sets_r1)) {
             let lower_frame = frame.max(16);
             let iadd = assemble::assemble(
                 "iadd3_imm__RsIR_RIR",
@@ -404,7 +407,8 @@ pub(super) fn translate_function(
         // The frame with the room made: the uniform registers, then as many words as an
         // instruction put away at once.
         borrow.frame_bytes = (4 * (borrow.slot_count() + borrow.spill) + 15) & !15;
-        if borrow.frame_bytes > 0
+        if from_r1
+            && borrow.frame_bytes > 0
             && let Some(ta) = ctx.top_again
         {
             return Err(Refused(format!(

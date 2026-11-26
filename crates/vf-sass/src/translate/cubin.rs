@@ -395,9 +395,26 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         b.assign_slots(&sorted_uniform, &pairs_set);
                         // VF_BORROW >= 5: room is made where there is none, and the frame
                         // is addressed from the stack pointer; in a function that never moves it.
+                        // A kernel that never uses R1 needs no stack pointer: its frame is
+                        // addressed from the top of the thread's local memory at each instruction,
+                        // and no room is made (spilling victims is addressed from the pointer).
                         if opts.borrow >= 5 && b.r1_fixed {
-                            b.room = true;
-                            b.from_r1 = true;
+                            let first = &fs[0].src[0];
+                            let entry_sets_r1 = super::stack_top(first)
+                                && first.writes == [(crate::decode::LETTER_R, 1)]
+                                && crate::pairing::unguarded(first);
+                            let uses_r1 = fs[0].src.iter().any(|d| {
+                                d.reads
+                                    .iter()
+                                    .any(|&(letter, register, _)| letter == crate::decode::LETTER_R && register == 1)
+                                    || d.writes
+                                        .iter()
+                                        .any(|&(letter, register)| letter == crate::decode::LETTER_R && register == 1)
+                            });
+                            if entry_sets_r1 || uses_r1 {
+                                b.room = true;
+                                b.from_r1 = true;
+                            }
                         }
                         // A uniform predicate held in a register: one register free through all its lives.
                         let mut spans_by_q: std::collections::BTreeMap<u32, std::collections::BTreeSet<usize>> =
@@ -593,6 +610,16 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         }
                     })
                 };
+                // At level 3, when the registers of the program are not enough, a kernel that is
+                // entered from outside may take those above the ones the program names: no
+                // caller keeps anything there, and the V100 has them (up to R252).
+                let extend_level3 = |attempt: &mut AttemptFn<'_>, gave_up: &[String]| -> Tried {
+                    if required.is_none() && fs.len() == 1 && entries.contains(&indices[0]) {
+                        attempt(false, 3, Some(252u32.saturating_sub(saves)), gave_up)
+                    } else {
+                        Err(Refused(String::new()))
+                    }
+                };
                 // plain(): level 0 with pairs fallback but no borrow (for the budget).
                 let plain = |attempt: &mut AttemptFn<'_>, gave_up: &[String]| {
                     attempt(true, 0, None, gave_up).or_else(|refused| {
@@ -632,7 +659,14 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                             // Try levels 1, 2, 3 in order.
                             let mut done = None;
                             for (do_p, bl) in [(true, 1u32), (true, 2), (false, 3)] {
-                                match attempt(do_p, bl, None, &gave_up) {
+                                let mut result = attempt(do_p, bl, None, &gave_up);
+                                if bl == 3
+                                    && result.is_err()
+                                    && let Ok(d) = extend_level3(&mut attempt, &gave_up)
+                                {
+                                    result = Ok(d);
+                                }
+                                match result {
                                     Ok(d) => { done = Some(d); break; }
                                     Err(e) => { gave_up.push(e.0); }
                                 }
@@ -706,14 +740,19 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                                                 Ok(d) => Ok(d),
                                                 Err(e3) => {
                                                     gave_up.push(e3.0);
-                                                    if std::env::var("VF_BORROW_SAY").is_ok() {
-                                                        eprintln!(
-                                                            "  refused\t{}\t{}\tand with borrowed registers: {}",
-                                                            fs[0].name, original_msg,
-                                                            gave_up[1..].join("; ")
-                                                        );
+                                                    match extend_level3(&mut attempt, &gave_up) {
+                                                        Ok(d) => Ok(d),
+                                                        Err(_) => {
+                                                            if std::env::var("VF_BORROW_SAY").is_ok() {
+                                                                eprintln!(
+                                                                    "  refused\t{}\t{}\tand with borrowed registers: {}",
+                                                                    fs[0].name, original_msg,
+                                                                    gave_up[1..].join("; ")
+                                                                );
+                                                            }
+                                                            Err(Refused(original_msg))
+                                                        }
                                                     }
-                                                    Err(Refused(original_msg))
                                                 }
                                             }
                                         }

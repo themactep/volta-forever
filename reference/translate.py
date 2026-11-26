@@ -835,7 +835,7 @@ class Function:
                 self._entry_sets_r1 = stack_top(d) and d.writes == [('R', 1)] and pairing.unguarded(d)
             elif stack_top(d) and self._top_again is None:
                 self._top_again = i
-            if frame and (stack_top(d) if i else not (stack_top(d) and d.writes == [('R', 1)] and pairing.unguarded(d))):
+            if self.borrow is not None and self.borrow.from_r1 and frame and (stack_top(d) if i else not (stack_top(d) and d.writes == [('R', 1)] and pairing.unguarded(d))):
                 # The frame is the top of the thread's local memory, and the program's own frame
                 # is kept under it by lowering the stack pointer where it is set: at the first
                 # instruction of a kernel, once.
@@ -954,7 +954,7 @@ class Function:
                 new = self.converted(i, self.q.before) + new + self.converted(i, self.q.after)
                 # The companions of address registers, made where the plan has them.
                 new = self.accompanied(i, self.q.made_before) + new + self.accompanied(i, self.q.made_after)
-            if i == 0 and (frame or (self.borrow is not None and self.borrow.room and self._entry_sets_r1)):
+            if i == 0 and self.borrow is not None and self.borrow.from_r1 and (frame or (self.borrow.room and self._entry_sets_r1)):
                 # Level 3: the stack pointer starts under the frame (checked above: this
                 # instruction sets it to the top, and nothing else reads the top). (With room
                 # to be made, how large the frame is is known at the end: `_lower`.)
@@ -1013,7 +1013,7 @@ class Function:
             # instruction put away at once.
             b = self.borrow
             b.frame_bytes = (4 * (b.slot_count() + b.spill) + 15) & ~15
-            if b.frame_bytes and self._top_again is not None:
+            if b.from_r1 and b.frame_bytes and self._top_again is not None:
                 raise Refused('a frame for the translation, and the top of the stack is read again at 0x%x' % (16 * self._top_again))
             if self._lower is not None:
                 if b.frame_bytes:
@@ -1301,6 +1301,7 @@ class Function:
         if r is None:
             raise Refused(why or 'no %s nothing at 0x%x' % ('register holds' if width == 1 else '%d registers in a row hold' % width, 16 * self.at))
         self.given |= ((1 << width) - 1) << r
+        self.next_register = max(self.next_register, r + width)
         if made:
             self.spilled.setdefault(self.at, []).extend(range(r, r + width))
         else:
@@ -3066,8 +3067,15 @@ def translate(data, mc=None, listing=None, lives=None):
                     b.everything = True
                     b.assign_slots(sorted(f.uniform), f.pairs)
                     # (`VF_BORROW=5`: room is made where there is none, and the frame is
-                    # addressed from the stack pointer; in a function that never moves it.)
-                    b.room = b.from_r1 = BORROW >= 5 and b.r1_fixed
+                    # addressed from the stack pointer; in a function that never moves it. A
+                    # kernel that never uses R1 needs no stack pointer: its frame is addressed
+                    # from the top of the thread's local memory at each instruction, and no room
+                    # is made: spilling victims is addressed from the pointer.)
+                    first = f.src[0]
+                    entry_sets_r1 = stack_top(first) and first.writes == [('R', 1)] and pairing.unguarded(first)
+                    uses_r1 = any(l == 'R' and r == 1 for d in f.src
+                                  for l, r, *_ in d.reads + [w + (None,) for w in d.writes])
+                    b.room = b.from_r1 = BORROW >= 5 and b.r1_fixed and (entry_sets_r1 or uses_r1)
                     # A uniform predicate held in a register between the instructions that name
                     # it: one register that holds nothing through all its lives.
                     spans = collections.defaultdict(set)
@@ -3123,6 +3131,17 @@ def translate(data, mc=None, listing=None, lives=None):
                 return out
             gave_up = []
             alone = len(fs) == 1 and indices[0] in entries
+            def extend_level3():
+                """At level 3, when the registers of the program are not enough, a kernel that is
+                entered from outside may take those above the ones the program names: no caller
+                keeps anything there, and the V100 has them (up to R252). Not one that requires
+                its block: how many registers that block may have is settled after the chain."""
+                if not alone:
+                    raise Refused('not a kernel entered from outside')
+                info = e.section('.nv.info.' + fs[0].name)
+                if info is not None and required_threads(info.data) is not None:
+                    raise Refused('a kernel that requires its block')
+                return attempt(False, False, 3, max(0, 252 - fs[0].save_slots))
             def usual():
                 try:
                     if BORROW and alone:
@@ -3192,12 +3211,19 @@ def translate(data, mc=None, listing=None, lives=None):
                         raise
                     gave_up.append(str(why))
                     done = None
-                    for way in (lambda: attempt(True, True, 1), lambda: attempt(True, True, 2), lambda: attempt(False, False, 3)):
+                    for level, way in ((1, lambda: attempt(True, True, 1)), (2, lambda: attempt(True, True, 2)),
+                                       (3, lambda: attempt(False, False, 3))):
                         try:
                             done = way()
                             break
                         except Refused as also:
                             gave_up.append(str(also))
+                            if level == 3:
+                                try:
+                                    done = extend_level3()
+                                    break
+                                except Refused as extended:
+                                    gave_up.append(str(extended))
                     if done is None:
                         if os.environ.get('VF_BORROW_SAY'):
                             print('  refused\t%s\t%s\tand with borrowed registers: %s' % (fs[0].name, why, '; '.join(gave_up[1:])), file=sys.stderr)
@@ -3237,12 +3263,19 @@ def translate(data, mc=None, listing=None, lives=None):
                         raise
                     gave_up.append(str(why))
                     done = None
-                    for way in (lambda: attempt(True, True, 1), lambda: attempt(True, True, 2), lambda: attempt(False, False, 3)):
+                    for level, way in ((1, lambda: attempt(True, True, 1)), (2, lambda: attempt(True, True, 2)),
+                                       (3, lambda: attempt(False, False, 3))):
                         try:
                             done = way()
                             break
                         except Refused as also:
                             gave_up.append(str(also))
+                            if level == 3:
+                                try:
+                                    done = extend_level3()
+                                    break
+                                except Refused as extended:
+                                    gave_up.append(str(extended))
                     if done is None:
                         if os.environ.get('VF_BORROW_SAY'):
                             print('  refused\t%s\t%s\tand with borrowed registers: %s' % (fs[0].name, why, '; '.join(gave_up[1:])), file=sys.stderr)

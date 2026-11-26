@@ -153,6 +153,8 @@ impl Ctx<'_> {
         for k in 0..width {
             regset_set(&mut self.given, r + k);
         }
+        // The section declares two more than the highest register the translation uses.
+        self.next_register = self.next_register.max(r + width);
         if made {
             let entry = self.spilled.entry(self.at).or_default();
             for k in 0..width {
