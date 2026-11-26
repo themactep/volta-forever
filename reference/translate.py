@@ -1223,6 +1223,39 @@ class Function:
         add(mc.assemble('prmt__RuIR_RIR', Rd=rd, Ra=s0, Sb=0x5410, Rc=s1), 'both halves')
         return new
 
+    def f2fp_f16(self, i, d, guard):
+        """Turing's F2FP.F16.F32 packs two f32 values into two f16 halves of one register.
+        Volta's F2F.F16.F32 converts one; two of them and a PRMT pack the pair. Only the plain
+        rounding to f16 is translated."""
+        ops = d.ops
+        if ops.get('dstfmt', 0) or ops.get('satfinite', 0) or ops.get('relu', 0) or ops.get('merge', 0) or ops.get('rndMode', 0):
+            raise Refused('F2FP with a destination format or a rounding that is not translated at 0x%x' % (16 * i))
+        rd, high, low = ops['Rd'], ops['Ra'], ops['Rb']
+        if rd == 255 or low == 255:
+            raise Refused('F2FP without a destination or a low source at 0x%x' % (16 * i))
+        new = []
+        if high == 255:
+            upper = 255
+        else:
+            try:
+                upper = self.pool(1)
+            except Refused:
+                upper = self.next_register
+                self.next_register += 1
+        def convert(dest, source, guarded, what):
+            word = self.mc.assemble('f2f_f32_downconvert__RRR_RRR', Rd=dest, Rb=source,
+                                    **{'dstfmt.srcfmt': 'F16.F32'}, **(guard if guarded else {}))
+            item = Item((word & ~(7 << WRITE_BARRIER)) | (ARRIVES << WRITE_BARRIER) | (63 << WAIT), i, what)
+            item.then = ARRIVES
+            new.append(item)
+        if high != 255:
+            convert(upper, high, False, 'f2fp: convert high half')
+        convert(rd, low, True, 'f2fp: convert low half')
+        permute = self.mc.assemble('prmt__RuIR_RIR', Rd=rd, Ra=rd, Sb=0x5410, Rc=upper, **guard)
+        permute = (permute & ~(7 << WRITE_BARRIER)) | ((d.word >> WRITE_BARRIER) & 7) << WRITE_BARRIER
+        new.append(Item(permute, i, 'f2fp: pack halves'))
+        return new
+
     def bf16_pack(self, i, d):
         """sm_80's F2FP.BF16.PACK_AB Rd, Ra, Rb: the f32 of Rb rounded to bf16 in the low half,
         that of Ra in the high half. (Ra of the surrogate is the low one, Rc the high one.)"""
@@ -1508,6 +1541,8 @@ class Function:
         ops = d.ops
         guard = {'Pg': ops['Pg'], 'Pg_not': ops.get('Pg@not', 0)} if 'Pg' in ops else {}
         wait = w & (63 << WAIT)
+        if name == 'f2fp__RRR':
+            return self.f2fp_f16(i, d, guard)
         if name in ('ldsm__sImmOffset', 'ldsm__URsIR'):
             if self.q is not None and i in self.q.loads:
                 return self.whole_rows(i, d, guard, wait)

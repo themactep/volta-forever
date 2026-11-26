@@ -116,6 +116,11 @@ pub(super) fn translate_one(ctx: &mut Ctx, i: usize, d: &Decoded) -> Result<Vec<
         return Ok(vec![Item::new(word, i, "without its cache hint", true)]);
     }
 
+    // 8c. F2FP (Turing): two f32 to two f16 in one register.
+    if name == "f2fp__RRR" {
+        return translate_f2fp_f16(ctx, i, d);
+    }
+
     // 9. Rule
     if let Some(target) = rule::rule_of_target(d.class_id) {
         return translate_rule(ctx, i, d, target);
@@ -525,4 +530,74 @@ pub(super) fn sm70_ldg_without_hints(d: &Decoded) -> Option<u128> {
             ("dst_wr_sb", assemble::OpVal::Int(d.op_or(OP_DST_WR_SB, 7))),
         ],
     )
+}
+
+/// Turing's `F2FP.F16.F32` packs two f32 values into two f16 halves of one register. Volta's
+/// `F2F.F16.F32` converts one value; two of them and a PRMT pack the pair. Only the plain
+/// rounding to f16 (the form the half kernels use) is translated.
+fn translate_f2fp_f16(ctx: &mut Ctx<'_>, i: usize, d: &Decoded) -> Result<Vec<Item>, Refused> {
+    // dstfmt 73, satfinite 107, relu 116, merge 117, rndMode 118 (names in `OP_NAMES`).
+    if d.op_or(73, 0) != 0
+        || d.op_or(107, 0) != 0
+        || d.op_or(116, 0) != 0
+        || d.op_or(117, 0) != 0
+        || d.op_or(118, 0) != 0
+    {
+        return Err(Refused(
+            "f2fp with a destination format or a rounding that is not translated".into(),
+        ));
+    }
+    let (rd, high, low) = (d.op_or(OP_RD, 255), d.op_or(OP_RA, 255), d.op_or(13, 255));
+    if rd == 255 || low == 255 {
+        return Err(Refused("f2fp without a destination or a low source".into()));
+    }
+    let (pg, pg_not) = (d.op_or(OP_PG, 7), d.op_or(OP_PG_AT_NOT, 0));
+    let mut items = Vec::new();
+    let upper = if high == 255 {
+        255
+    } else if let Ok(register) = ctx.pool(1) {
+        register
+    } else {
+        let register = ctx.next_register;
+        ctx.next_register += 1;
+        register
+    };
+    let mut convert = |dest: u32, source: u32, guarded: bool, what: &'static str| -> Result<(), Refused> {
+        let mut ops = vec![
+            ("dstfmt.srcfmt", assemble::OpVal::Str("F16.F32")),
+            ("Rd", assemble::OpVal::Int(dest)),
+            ("Rb", assemble::OpVal::Int(source)),
+        ];
+        if guarded {
+            ops.push(("Pg", assemble::OpVal::Int(pg)));
+            ops.push(("Pg_not", assemble::OpVal::Int(pg_not)));
+        }
+        let word = assemble::assemble("f2f_f32_downconvert__RRR_RRR", &ops)
+            .ok_or_else(|| Refused("cannot assemble F2F for f2fp".into()))?;
+        let word = (word & !(7u128 << WRITE_BARRIER)) | (u128::from(ARRIVES) << WRITE_BARRIER) | (63u128 << WAIT);
+        let mut item = Item::new(word, i, what, true);
+        item.then = Some(ARRIVES);
+        items.push(item);
+        Ok(())
+    };
+    if high != 255 {
+        convert(upper, high, false, "f2fp: convert high half")?;
+    }
+    convert(rd, low, true, "f2fp: convert low half")?;
+    let permute = assemble::assemble(
+        "prmt__RuIR_RIR",
+        &[
+            ("Rd", assemble::OpVal::Int(rd)),
+            ("Ra", assemble::OpVal::Int(rd)),
+            ("Sb", assemble::OpVal::Int(0x5410)),
+            ("Rc", assemble::OpVal::Int(upper)),
+            ("Pg", assemble::OpVal::Int(pg)),
+            ("Pg_not", assemble::OpVal::Int(pg_not)),
+        ],
+    )
+    .ok_or_else(|| Refused("cannot assemble PRMT for f2fp".into()))?;
+    // The source's write barrier is the translation's last instruction's, or none.
+    let permute = (permute & !(7u128 << WRITE_BARRIER)) | ((d.word >> WRITE_BARRIER) & 7) << WRITE_BARRIER;
+    items.push(Item::new(permute, i, "f2fp: pack halves", true));
+    Ok(items)
 }
