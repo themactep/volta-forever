@@ -81,7 +81,9 @@ class Elf:
         shoff = len(out)
         for s, offset in zip(self.sections, offsets):
             size = s.size if s.type in (SHT_NULL, SHT_NOBITS) else len(s.data)
-            out += struct.pack('<IIQQQQIIQQ', s.name_offset, s.type, s.flags, s.addr, offset, size, s.link, s.info, s.align, s.entsize)
+            # A .text section's sh_info is 0; the cubin's other value is not one this writer can pack.
+        info = 0 if s.name.startswith('.text') else s.info
+        out += struct.pack('<IIQQQQIIQQ', s.name_offset, s.type, s.flags, s.addr, offset, size, s.link, info, s.align, s.entsize)
         phoff = len(out) if self.phnum else 0
         for seg in self.segments:
             type_, flags, offset, vaddr, paddr, filesz, memsz, align = seg
