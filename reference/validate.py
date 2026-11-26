@@ -122,6 +122,12 @@ def texts(code, sm):
         for i, t in enumerate(out):
             if t is None:
                 out[i] = disassemble([0x000fc000000000000000000000007918] * i + [words[i]], sm)[0][-1]
+    if sm == 75:
+        # Turing's F2FP (a packed conversion) is an encoding of the sm_75 description that
+        # NVIDIA's disassembler does not read for SM75; it reads the same encoding for SM80.
+        for i, t in enumerate(out):
+            if t is None:
+                out[i] = disassemble([0x000fc000000000000000000000007918] * i + [words[i]], 80)[0][-1]
     return out
 
 
@@ -527,7 +533,7 @@ def register_lives(mc, code, texts75, tables, problems=None, name=''):
             continue
         if m == 'BRA':
             _true = lambda p: ops.get(p, 7) == 7 and not ops.get(p + '@not', 0)
-            always = ug and _true('Pp') and not ops.get('cond')
+            always = ug and _true('Pp') and ops.get('cond', 0) in (0, 1)
             rel = TR.relative(mc, 75, d)
             target = None
             if rel is not None:
@@ -1141,7 +1147,7 @@ def predicate_lives(mc, code, texts75, tables):
             continue
         if m == 'BRA':
             _true = lambda p: ops.get(p, 7) == 7 and not ops.get(p + '@not', 0)
-            always = ug and _true('Pp') and not ops.get('cond')
+            always = ug and _true('Pp') and ops.get('cond', 0) in (0, 1)
             rel = TR.relative(mc, 75, d)
             target = None
             if rel is not None:
@@ -2059,7 +2065,7 @@ def schedule(mc, code, highest, sequences=frozenset(), borrowed=frozenset(), add
                 if before.kind == 'BRU' and before.mnemonic not in ('BSSY', 'BMOV'):
                     ops = before.ops
                     always = (ops.get('Pg', 7) == 7 and not ops.get('Pg@not') and ops.get('Pp', 7) == 7
-                              and not ops.get('Pp@not') and not ops.get('cond'))
+                              and not ops.get('Pp@not') and ops.get('cond', 0) in (0, 1))
                     if before.mnemonic != 'BRA' or always:
                         break                        # what is before it did not run just before
                 written = {register for letter, register in before.writes if letter == 'P' and register < 7}
@@ -2224,7 +2230,7 @@ def code_successors(mc, words, decoded):
                     target = j + 1 + v * data[1] // 16
         ops = d.ops
         always = (ops.get('Pg', 7) == 7 and not ops.get('Pg@not') and ops.get('Pp', 7) == 7
-                  and not ops.get('Pp@not') and not ops.get('cond'))
+                  and not ops.get('Pp@not') and ops.get('cond', 0) in (0, 1))
         if not (d.mnemonic in ('BRA', 'EXIT', 'RET', 'JMP', 'BRX', 'JMX') and always) and j + 1 < len(words):
             nexts.append((j + 1, False))
         if target is not None and 0 <= target < len(words):
@@ -2970,7 +2976,7 @@ def compute_r1_depth(mc, original_code, texts75, tables):
                 return {}, False
         elif m == 'BRA':
             _true = lambda p: ops.get(p, 7) == 7 and not ops.get(p + '@not', 0)
-            always = ug and _true('Pp') and not ops.get('cond')
+            always = ug and _true('Pp') and ops.get('cond', 0) in (0, 1)
             rel = TR.relative(mc, 75, d)
             target = None
             if rel is not None:
@@ -3602,6 +3608,11 @@ def main():
                     same = after is not None and guarded(before.group(0), after.group(0), old)
                 else:
                     same = (before and before.group(0)) == (after and after.group(0))
+                if not same and w.startswith('zero fill: load') and after is not None:
+                    # A Turing load that names the predicate where it loads: sm_70 has no such
+                    # operand, and what it becomes loads under it (and zeroes the rest).
+                    fill = re.search(r', (!?P\d+)$', source or '')
+                    same = bool(fill) and after.group(0).strip() == '@' + fill.group(1)
                 if not same:
                     say(new, old, w, 'reads or writes memory under another guard than the instruction')
             # ---- rule V: the values that the moves of the frame carry, in the whole sequence ----
@@ -4379,6 +4390,57 @@ def main():
             elif whats == ['without its cache hint']:
                 if re.sub(r'\.LTC\d+B', '', source) != got[0] or source == got[0]:
                     say(new, old, 'cache hint', 'not the instruction without its hint')
+            elif whats[0] == 'zero fill: load where the predicate holds' and set(whats[1:]) <= {'zero fill: zeros elsewhere'}:
+                # A Turing load that names the predicate where it loads and zeroes the rest:
+                # sm_70 has no such operand, and ptxas writes it for Volta as the load under the
+                # predicate and a MOV of RZ into each destination under its complement.
+                m = re.match(r'(LDG\S*) (R\d+), (\[[^\]]*\]), (!?P\d+)$', unreused(source))
+                ok = bool(m) and len(whats) == len(got)
+                if ok:
+                    body = re.sub(r'\.LTC\d+B', '', m.group(1))
+                    pred = m.group(4)
+                    size = re.search(r'\.(32|64|128)(?:\.|$)', body)
+                    registers = {'32': 1, '64': 2, '128': 4}.get(size.group(1)) if size else 1
+                    other = pred[1:] if pred.startswith('!') else '!' + pred
+                    first = int(m.group(2)[1:])
+                    want = ['@%s MOV R%d, RZ' % (other, first + k) for k in range(registers or 0)]
+                    ok = bool(registers) and got[0] == '@%s %s %s, %s' % (pred, body, m.group(2), m.group(3)) and got[1:] == want
+                    if ok:
+                        kinds['(load) Turing zero-fill loads'] += 1
+                if not ok:
+                    say(new, old, 'zero fill', 'not the load under its predicate and a MOV of RZ into each destination under its complement')
+            elif whats[0].startswith('f2fp: ') and set(whats) <= {'f2fp: convert high half', 'f2fp: convert low half', 'f2fp: pack halves'}:
+                # Turing's F2FP.PACK_AB: two f32 values converted to f16 and packed in one
+                # register. (The text is nvdisasm's sm_80 reading: the sm_75 description has the
+                # encoding, but NVIDIA's disassembler does not print it for SM75.) Volta has no
+                # such instruction: the high half is converted in a register of the translation,
+                # the low half into the destination, and a PRMT packs the two halves.
+                m = re.match(r'(@!?P\d )?F2FP(?:\.F16\.F32)?\.PACK_AB (R\d+), (R\d+), (R\d+)$', unreused(source))
+                ok = bool(m)
+                if ok:
+                    guard, rd, high, low = m.groups()
+                    guard = guard or ''
+                    at, upper = 0, 'RZ'
+                    if high != 'RZ':
+                        p = re.match(r'F2F\.F16\.F32 (R\d+), %s$' % high, got[0])
+                        ok = bool(p)
+                        at, upper = 1, p.group(1) if p else 'RZ'
+                    ok = ok and len(got) == at + 2
+                    if ok:
+                        q = re.match(r'%sF2F\.F16\.F32 %s, %s$' % (guard, rd, low), got[at])
+                        r = re.match(r'%sPRMT %s, %s, 0x5410, %s$' % (guard, rd, rd, upper), got[at + 1])
+                        ok = bool(q and r)
+                    if ok and upper != 'RZ':
+                        rn = int(upper[1:])
+                        ok = rn > highest or rn >= 2
+                        if rn <= highest and rn >= 2:
+                            borrowed_regs.add(rn)
+                        elif rn > highest:
+                            scratch.add(upper)
+                    if ok:
+                        kinds['(conversions) Turing packed f32 to f16'] += 1
+                if not ok:
+                    say(new, old, 'F2FP', 'not two conversions and a PRMT that packs their halves')
             elif whats[0] == 'kept: low':
                 # ---- Level-3 matrix product: everything taken at the instruction ----
                 # The lane was already stripped; its per-instruction register is in `per_inst_lane`.

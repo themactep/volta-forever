@@ -453,6 +453,18 @@ def patched(control):
     matrix_load, matrix_product, kept = Function.matrix_load, Function.matrix_product, Function.kept
     kept_for_rows, whole_rows, half_of_pair, converted = Function.kept_for_rows, Function.whole_rows, Function.half_of_pair, Function.converted
     given_back = Function.given_back
+    f2fp_f16, ldg_without_hints = Function.f2fp_f16, Function.ldg_without_hints
+
+    def f2fp_without_pack(self, i, d, guard):
+        """The packed conversion without the instruction that packs the halves: the high half
+        is converted into a register of the translation and never used. The validator's rule
+        for the sequence must object."""
+        return [item for item in f2fp_f16(self, i, d, guard) if item.what != 'f2fp: pack halves']
+
+    def ldg_missing_zeros(self, i, d):
+        """A zero-filled load without the MOVs that zero it where its predicate does not hold:
+        what is out of range is loaded. The validator's rule for the sequence must object."""
+        return [item for item in ldg_without_hints(self, i, d) if item.what != 'zero fill: zeros elsewhere']
 
     NOP = 0x000fc000000000000000000000007918
 
@@ -890,6 +902,8 @@ def patched(control):
         'as it is': {},
         'lepc_not_adjacent': {'return_addresses': lepc_not_adjacent},
         'lepc_register_changed': {'return_addresses': lepc_register_changed},
+        'f2fp_without_pack': {'f2fp_f16': f2fp_without_pack},
+        'ldg_missing_zeros': {'ldg_without_hints': ldg_missing_zeros},
         'unsaved': {'stand_ins': unsaved},
         'blind': {'liveness': blind},
         'cut': {'liveness': cut},
@@ -1372,6 +1386,10 @@ def patched(control):
 
 CONTROLS = ['as it is', 'unsaved', 'blind', 'cut', 'masks', 'nowait', 'close', 'doublesoon', 'doubleacross', 'returns', 'waitless', 'unlisted', 'swapped', 'batched', 'unmoved', 'named', 'unguarded', 'lanes', 'unwaited', 'unordered', 'complement_rewritten', 'complement_same', 'soon', 'partial', 'boardless', 'unmasked', 'early', 'unheld', 'unwritten', 'stale', 'unkept', 'unpaired', 'misruled', 'slowno', 'slowshort', 'slownowait', 'slownever', 'slowfree', 'slowsaved', 'alive_scratch']
 
+# Encodings of sm_75 that no cubin of the repository has: a Turing zero-fill load (Pnz) and
+# F2FP, which the CUDA 13.5 cuBLAS half kernels use. Run them by name on a cubin that has one
+# (`controls.py -c ...`); tests/sass/controls.sh does not run them.
+HALF_CONTROLS = ['f2fp_without_pack', 'ldg_missing_zeros']
 # A direct call whose return address is the program counter of the LEPC immediately before it
 # (cuDNN 9.24's sm_75 kernels): tests/kernels/translate/k_lepc.sm75.cubin carries the pair, so
 # these run in the passes of tests/sass/controls.sh.
@@ -1501,7 +1519,7 @@ def run(mc, control, path, out_dir, untouched, validated=True):
     """(problems validate.py finds, its first objection) for one cubin; (None, '') when the control
     changed nothing in its translation, which `untouched` holds by path. (`validated` false: the
     translation as it is is kept there and not validated.)"""
-    originals = {name: getattr(Function, name) for name in ('stand_ins', 'liveness', 'late', 'schedule', 'return_addresses', 'matrix_load', 'matrix_product', 'kept', 'kept_gathering', 'given_back', 'all_predicates', 'waits_for', 'masked', 'translate', 'one',
+    originals = {name: getattr(Function, name) for name in ('stand_ins', 'liveness', 'late', 'schedule', 'return_addresses', 'matrix_load', 'matrix_product', 'kept', 'kept_gathering', 'given_back', 'all_predicates', 'waits_for', 'masked', 'translate', 'one', 'f2fp_f16', 'ldg_without_hints',
                                                              'kept_for_rows', 'whole_rows', 'half_of_pair', 'converted',
                                                              'from_memory', 'to_memory', 'frame_top', 'load_word', 'store_word', 'read_back')}
     for name, replacement in patched(control).items():
@@ -2735,7 +2753,7 @@ def run(mc, control, path, out_dir, untouched, validated=True):
 def main():
     args, chosen, paths, unchecked = sys.argv[1:], [], [], False
     while args:
-        if args[0] == '-c' and len(args) > 1 and (args[1] in CONTROLS or args[1] in LEPC_CONTROLS):
+        if args[0] == '-c' and len(args) > 1 and (args[1] in CONTROLS or args[1] in HALF_CONTROLS or args[1] in LEPC_CONTROLS):
             chosen.append(args[1])
             args = args[2:]
         elif args[0] == '-u':
@@ -2749,7 +2767,7 @@ def main():
     ok, untouched = True, {}
     with tempfile.TemporaryDirectory(prefix='vf-controls-') as out_dir:
         print('%-10s %s' % ('control', '  '.join('%14s' % os.path.basename(p)[:14] for p in paths)))
-        for control in CONTROLS + [c for c in LEPC_CONTROLS if c not in CONTROLS]:
+        for control in CONTROLS + [c for c in HALF_CONTROLS + LEPC_CONTROLS if c not in CONTROLS]:
             if chosen and control not in chosen and control != 'as it is':
                 continue
             if control in PAIR_CONTROLS and not translate.PAIRS:
