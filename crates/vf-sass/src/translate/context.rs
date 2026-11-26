@@ -243,8 +243,9 @@ impl Ctx<'_> {
             "a sequence that goes by the lane in a function that was not given a register for it".into(),
         ))
     }
-    /// The first of the registers that the sequence of a matrix instruction computes into
-    /// (`MATRIX_SCRATCH` of them). At level 3: that many in a row from an even one.
+    /// The first of the registers that a sequence computes into: those of a matrix instruction
+    /// (`MATRIX_SCRATCH` of them), or the one register of a Turing F2FP's high half. At level 3:
+    /// that many in a row from an even one.
     pub(super) fn scratch(&mut self) -> Result<u32, Refused> {
         if let Some(r) = self.scratch_at_reg {
             return Ok(r);

@@ -573,7 +573,9 @@ class Function:
         self.needs_lane = any(d.c.name in MATRIX for d in self.src)
         self.has_product = any(d.c.name == 'hmma_x8_' for d in self.src)
         self.product_count = sum(1 for d in self.src if d.c.name == 'hmma_x8_')
-        self.scratch_need = MATRIX_SCRATCH if self.needs_lane else 0
+        self.scratch_need = MATRIX_SCRATCH if self.needs_lane else (
+            1 if any(d.c.name == 'f2fp__RRR' and d.ops.get('Ra', 255) != 255 for d in self.src)
+            and not self.needs_pool else 0)
         self.q = None                               # the plan of pairs on whole rows (`plan_pairs`)
         self.borrow = None                          # the registers of its own that the translation may take (`Borrowed`)
         self.entered_inside = False                 # set by `translate`: a symbol of another function points into it
@@ -1240,8 +1242,9 @@ class Function:
             try:
                 upper = self.pool(1)
             except Refused:
-                upper = self.next_register
-                self.next_register += 1
+                # No pool: the high half is converted in the scratch register placed for it
+                # (one per function, not one for each conversion: they do not overlap).
+                upper = self.scratch()
         def convert(dest, source, guarded, what):
             word = self.mc.assemble('f2f_f32_downconvert__RRR_RRR', Rd=dest, Rb=source,
                                     **{'dstfmt.srcfmt': 'F16.F32'}, **(guard if guarded else {}))
@@ -1645,20 +1648,11 @@ class Function:
             return [Item((move & ~(31 << USCHED)) | (w & (31 << USCHED)) | wait, i, 'move')]
         if name in ('ldg__sImmOffset', 'ld__sImmOffset') and ops.get('sp2'):
             # What the load says to the cache about its neighbours: sm_70 has no such thing to say.
-            return [Item(self.put(d.c, w, 'sp2', 0), i, 'without its cache hint')]
-        if (name == 'ldg__sImmOffset' and mc.decode(70, w) is None
-                and ops.get('e') == 1 and ops.get('sz') in (5, 6)
-                and ops.get('sem') in (0, 1, 2) and ops.get('sco') in (2, 3)
-                and ops.get('cop') == 1):
-            # The Turing table's LTC128B and the like: rebuild the load with sm_70's table, keeping
-            # its data, guard and scoreboards. What changes is the cache hint.
-            target = mc.assemble('ldg__sImmOffset',
-                e=ops.get('e', 1), sz=ops['sz'], sem=ops['sem'], sco=ops['sco'], cop=ops['cop'],
-                Pu=ops.get('Pu', 7), Rd=ops['Rd'], Ra=ops['Ra'], Ra_offset=ops.get('Ra_offset', 0),
-                Pg=ops.get('Pg', 7), Pg_not=ops.get('Pg@not', 0),
-                src_rel_sb=ops.get('src_rel_sb', 7), dst_wr_sb=ops.get('dst_wr_sb', 7))
-            if mc.decode(70, target) is not None:
-                return [Item(target, i, 'without its cache hint')]
+            cleared = self.put(d.c, w, 'sp2', 0)
+            if mc.decode(70, cleared) is not None:
+                return [Item(self.without_batch(name, cleared), i, 'without its cache hint')]
+        if name == 'ldg__sImmOffset' and mc.decode(70, w) is None:
+            return self.ldg_without_hints(i, d)
         if name in mc.rule_of:
             out = self.rule(d, mc.rule_of[name], i)
             after = mc.decode(70, out)
@@ -2278,6 +2272,57 @@ class Function:
             word = self.mc.assemble('shfl__RRI', shflmd=0, Pu=7, Rd=r, Ra=r, Rb=self.kept_rows['pi' if to == pairing.Q else 'inv'], Sc=31, dst_wr_sb=SEQUENCE)
             out.append(Item(word | ((1 << (WAIT + SEQUENCE)) if k and k % 8 == 0 else 0), i, 'to pairs' if to == pairing.Q else 'from pairs'))
         out[-1].then = SEQUENCE
+        return out
+
+    def without_batch(self, name, word):
+        """`word`, a load the translation changed, with the batch of its original scheduling
+        table cleared: what the translation changed names no batch (its schedule is the
+        translation's). The wait hint of the table (its low five bits) stays."""
+        cls = self.mc.md70.by_name[name]
+        for kind, fields, data in self.mc.d70.plan(cls):
+            if kind == 'table' and data[0] == 'TABLES_opex_0':
+                opex = fields[0].get(word)
+                if opex >> 5:
+                    word = fields[0].put(word, opex & 31)
+                break
+        return word
+
+    def ldg_without_hints(self, i, d):
+        """A Turing global load whose sm_70 form is not the same word: the cache/scope table it
+        carries is not sm_70's, and it may name a zero-fill predicate (Pnz). The word is rebuilt
+        with sm_70's table. When Pnz is named, the load is done where the predicate holds and the
+        destinations are set to zero elsewhere, as ptxas writes such a load for Volta itself."""
+        mc, ops = self.mc, d.ops
+        fill = ops.get('TABLES_Pnz_0(Pnz@not,Pnz)', 0)
+        def rebuild(pg, pg_not):
+            e, sz, sem, sco, cop = (ops.get(k) for k in ('e', 'sz', 'sem', 'sco', 'cop'))
+            if (e not in (0, 1) or sz not in (4, 5, 6) or sem is None or sem > 3
+                    or sco is None or sco > 3 or cop is None or cop > 5):
+                return None
+            return mc.assemble('ldg__sImmOffset', e=e, sz=sz, sem=sem, sco=sco, cop=cop,
+                Pu=ops.get('Pu', 7), Rd=ops['Rd'], Ra=ops['Ra'], Ra_offset=ops.get('Ra_offset', 0),
+                Pg=pg, Pg_not=pg_not,
+                src_rel_sb=ops.get('src_rel_sb', 7), dst_wr_sb=ops.get('dst_wr_sb', 7))
+        unavailable = Refused("no translation for the Turing global load's cache or scope at 0x%x" % (16 * i))
+        if fill == 0:
+            target = rebuild(ops.get('Pg', 7), ops.get('Pg@not', 0))
+            if target is None or mc.decode(70, target) is None:
+                raise unavailable
+            return [Item(target, i, 'without its cache hint')]
+        if ops.get('Pg', 7) != 7 or ops.get('Pg@not', 0):
+            raise Refused('a Turing global load with a guard and a zero-fill predicate at 0x%x' % (16 * i))
+        # The table of Pnz: 0 is PT, 1 to 7 are P6 down to P0 (the table of an operand's
+        # predicate and that of the instruction's guard number them differently), bit 3 negates.
+        index, not_ = fill & 7, (fill >> 3) & 1
+        predicate = 7 if index == 0 else 7 - index
+        target = rebuild(predicate, not_)
+        if target is None or mc.decode(70, target) is None:
+            raise unavailable
+        out = [Item(target, i, 'zero fill: load where the predicate holds')]
+        for letter, register, *_ in d.writes:
+            if letter == 'R':
+                zero = mc.assemble('mov__RRR_RR', Pg=predicate, Pg_not=1 - not_, Rd=register, Rb=255)
+                out.append(Item(zero, i, 'zero fill: zeros elsewhere'))
         return out
 
     def uniform_address(self, i, d, plain):

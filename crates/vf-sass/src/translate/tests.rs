@@ -1859,3 +1859,98 @@ fn a_turing_global_load_gets_the_sm70_cache_and_scope() {
         );
     }
 }
+
+/// Turing's F2FP converts its high half in a register of the translation that is placed once for
+/// the function, with the scratch ones: not one more register for every conversion (which ran
+/// past the 255 registers a V100 has, and left the section header unable to say how many).
+#[test]
+fn a_turing_packed_conversion_uses_the_scratch_register() {
+    use crate::generated::fields::{OP_RA, OP_RB, OP_RD};
+    let mut dec75 = Decoder::new(75);
+    let mut dec70 = Decoder::new(70);
+    // The half kernel's `f2fp__RRR` at 0x3ce0 (Rd=184, Ra=185, Rb=184), on small registers.
+    let base = 0x011fe400000000ff000000b8b9b8723eu128;
+    let mut field = |word, name, value| {
+        let d = dec75.decode(word).expect("sm_75 F2FP");
+        super::util::put_operand(&d, name, value, 75).expect("the operand is in its class")
+    };
+    let word = field(base, OP_RD, 2);
+    let word = field(word, OP_RA, 3);
+    let word = field(word, OP_RB, 2);
+    let f2fp = dec75.decode(word).expect("sm_75 F2FP");
+    assert_eq!(
+        (f2fp.op_or(OP_RD, 255), f2fp.op_or(OP_RA, 255), f2fp.op_or(OP_RB, 255)),
+        (2, 3, 2)
+    );
+    let exit = assemble::assemble("exit_", &[]).unwrap();
+    let src = vec![f2fp, dec75.decode(exit).expect("sm_75 EXIT")];
+    let fd = FuncData {
+        name: "f2fp_test".into(),
+        registers: 8,
+        tables: vec![],
+        src,
+        uniform: vec![],
+        pairs: vec![],
+        needs_pool: false,
+        uniform_predicates: vec![],
+        highest: 3,
+        scratch_need: 1,
+        needs_lane: false,
+        product_count: 0,
+        entered_inside: false,
+        ampere: false,
+        ampere_ops: HashMap::new(),
+    };
+    let predicates = super::context::stand_ins(&fd).unwrap();
+    let result = super::function::translate_function(
+        &mut dec70,
+        &fd,
+        &predicates,
+        &HashMap::new(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(4),
+        5,
+        None,
+        HashMap::new(),
+        HashMap::new(),
+        false,
+        false,
+        &HashMap::new(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(result.count, 7, "the five program and scratch registers, and two more");
+    assert_eq!(
+        result.items.iter().map(|item| item.what).collect::<Vec<_>>(),
+        [
+            "f2fp: convert high half",
+            "f2fp: convert low half",
+            "f2fp: pack halves",
+            "same"
+        ]
+    );
+    let mut ops = |k: usize| dec70.decode(result.items[k].word).expect("sm_70").clone();
+    let high = ops(0);
+    let low = ops(1);
+    let pack = ops(2);
+    assert_eq!(
+        high.op_or(crate::generated::fields::OP_RD, 255),
+        4,
+        "the high half converts into the scratch register"
+    );
+    assert_eq!(
+        low.op_or(crate::generated::fields::OP_RD, 255),
+        2,
+        "the low half into the destination"
+    );
+    assert_eq!(pack.op_or(crate::generated::fields::OP_RD, 255), 2);
+    assert_eq!(
+        pack.op_or(crate::generated::fields::OP_RC, 255),
+        4,
+        "the pack reads the scratch register"
+    );
+}

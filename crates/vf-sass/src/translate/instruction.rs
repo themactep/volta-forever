@@ -105,15 +105,11 @@ pub(super) fn translate_one(ctx: &mut Ctx, i: usize, d: &Decoded) -> Result<Vec<
             return Ok(vec![Item::new(cleared, i, "without its cache hint", true)]);
         }
     }
-    // 8b. A Turing table with hints that sm_70's does not have (LTC128B and the like). Rebuild
-    // the global load with sm_70's table, keeping its data, guard and scoreboards: what changes
-    // is the cache hint, which is what "without its cache hint" says.
-    if name == "ldg__sImmOffset"
-        && ctx.dec70.decode(w).is_none()
-        && let Some(word) = sm70_ldg_without_hints(d)
-        && ctx.dec70.decode(word).is_some()
-    {
-        return Ok(vec![Item::new(word, i, "without its cache hint", true)]);
+    // 8b. A Turing table with hints that sm_70's does not have (LTC128B and the like), and the
+    // zero-fill predicate a Turing load may carry. Rebuild with sm_70's table, keeping its data,
+    // guard and scoreboards: what changes is the cache hint.
+    if name == "ldg__sImmOffset" && ctx.dec70.decode(w).is_none() {
+        return translate_ldg_without_hints(ctx, i, d);
     }
 
     // 8c. F2FP (Turing): two f32 to two f16 in one register.
@@ -486,13 +482,32 @@ pub(super) fn without_batch(class_name: &str, d: &Decoded, word: u128) -> Result
 /// constant state, scope and cop fields are the sm_70 ones; the data, guard and scoreboards are
 /// the instruction's. None for a size or state that this does not know.
 pub(super) fn sm70_ldg_without_hints(d: &Decoded) -> Option<u128> {
+    sm70_ldg(d, d.op_or(OP_PG, 7), d.op_or(OP_PG_AT_NOT, 0))
+}
+
+/// `word`, a load the translation changed, with the batch of its original scheduling table
+/// cleared: what the translation changed names no batch (its schedule is the translation's).
+/// The wait hint of the table (its low five bits) stays.
+fn without_batch(class_name: &str, d: &Decoded, word: u128) -> Result<u128, Refused> {
+    let table = "TABLES_opex_0(batch_t,usched_info)";
+    let value = d.op_or_name(table, 0);
+    if value >> 5 == 0 {
+        return Ok(word);
+    }
+    put_operand_by_class(class_name, word, table, u64::from(value & 31), false)
+}
+
+/// The same global load as `d` with the given guard, and with the sm_70 cache and scope table.
+fn sm70_ldg(d: &Decoded, pg: u32, pg_not: u32) -> Option<u128> {
     // The source's e, sem, sco and cop are fields 2, 6, 7 and 4 of the sm_75 class (their names
-    // in `OP_NAMES`); only the values seen in place of a Turing-only table are given here.
+    // in `OP_NAMES`); the values are those of the sm_70 enumerations too.
     let e = match d.op_or(2, 255) {
+        0 => "noe",
         1 => "E",
         _ => return None,
     };
     let sz = match d.op_or(OP_SZ, 255) {
+        4 => "_32",
         5 => "_64",
         6 => "_128",
         _ => return None,
@@ -501,15 +516,23 @@ pub(super) fn sm70_ldg_without_hints(d: &Decoded) -> Option<u128> {
         0 => "CONSTANT",
         1 => "WEAK",
         2 => "STRONG",
+        3 => "MMIO",
         _ => return None,
     };
     let sco = match d.op_or(7, 255) {
+        0 => "CTA",
+        1 => "SM",
         2 => "GPU",
         3 => "SYS",
         _ => return None,
     };
     let cop = match d.op_or(4, 255) {
+        0 => "EF",
         1 => "EN",
+        2 => "EL",
+        3 => "LU",
+        4 => "EU",
+        5 => "NA",
         _ => return None,
     };
     assemble::assemble(
@@ -524,12 +547,65 @@ pub(super) fn sm70_ldg_without_hints(d: &Decoded) -> Option<u128> {
             ("Rd", assemble::OpVal::Int(d.op_or(OP_RD, 255))),
             ("Ra", assemble::OpVal::Int(d.op_or(OP_RA, 255))),
             ("Ra_offset", assemble::OpVal::Int(d.op_or(OP_RA_OFFSET, 0))),
-            ("Pg", assemble::OpVal::Int(d.op_or(OP_PG, 7))),
-            ("Pg_not", assemble::OpVal::Int(d.op_or(OP_PG_AT_NOT, 0))),
+            ("Pg", assemble::OpVal::Int(pg)),
+            ("Pg_not", assemble::OpVal::Int(pg_not)),
             ("src_rel_sb", assemble::OpVal::Int(d.op_or(OP_SRC_REL_SB, 7))),
             ("dst_wr_sb", assemble::OpVal::Int(d.op_or(OP_DST_WR_SB, 7))),
         ],
     )
+}
+
+/// A Turing global load whose sm_70 form is not the same word: the cache/scope table it carries
+/// is not sm_70's, and it may name a zero-fill predicate (Pnz). The word is rebuilt with sm_70's
+/// table. When Pnz is named, the load is done where the predicate holds and the destinations
+/// are set to zero elsewhere, as ptxas writes such a load for Volta itself.
+fn translate_ldg_without_hints(ctx: &mut Ctx<'_>, i: usize, d: &Decoded) -> Result<Vec<Item>, Refused> {
+    let fill = d.op_or_name("TABLES_Pnz_0(Pnz@not,Pnz)", 0);
+    let no_translation = || {
+        Refused(format!(
+            "no translation for the Turing global load's cache or scope at 0x{:x}",
+            16 * i
+        ))
+    };
+    if fill == 0 {
+        let word = sm70_ldg_without_hints(d).ok_or_else(no_translation)?;
+        if ctx.dec70.decode(word).is_none() {
+            return Err(no_translation());
+        }
+        return Ok(vec![Item::new(word, i, "without its cache hint", true)]);
+    }
+    if d.op_or(OP_PG, 7) != 7 || d.op_or(OP_PG_AT_NOT, 0) != 0 {
+        return Err(Refused(
+            "a Turing global load with a guard and a zero-fill predicate".into(),
+        ));
+    }
+    // The table of Pnz: 0 is PT, 1 to 7 are P6 down to P0 (the table of an operand's predicate
+    // and that of the instruction's guard number them differently), bit 3 negates.
+    let index = fill & 7;
+    let not = (fill >> 3) & 1;
+    let predicate = if index == 0 { 7 } else { 7 - index };
+    let word = sm70_ldg(d, predicate, not).ok_or_else(no_translation)?;
+    if ctx.dec70.decode(word).is_none() {
+        return Err(no_translation());
+    }
+    let mut items = vec![Item::new(word, i, "zero fill: load where the predicate holds", true)];
+    for &(letter, register) in &d.writes {
+        if letter != crate::decode::LETTER_R {
+            continue;
+        }
+        let zero = assemble::assemble(
+            "mov__RRR_RR",
+            &[
+                ("Pg", assemble::OpVal::Int(predicate)),
+                ("Pg_not", assemble::OpVal::Int(1 - not)),
+                ("Rd", assemble::OpVal::Int(register)),
+                ("Rb", assemble::OpVal::Int(255)),
+            ],
+        )
+        .ok_or_else(|| Refused("cannot assemble MOV for a zero-filled load".into()))?;
+        items.push(Item::new(zero, i, "zero fill: zeros elsewhere", true));
+    }
+    Ok(items)
 }
 
 /// Turing's `F2FP.F16.F32` packs two f32 values into two f16 halves of one register. Volta's
@@ -558,9 +634,9 @@ fn translate_f2fp_f16(ctx: &mut Ctx<'_>, i: usize, d: &Decoded) -> Result<Vec<It
     } else if let Ok(register) = ctx.pool(1) {
         register
     } else {
-        let register = ctx.next_register;
-        ctx.next_register += 1;
-        register
+        // No pool: the high half is converted in the scratch register that `parse` placed for
+        // it (one per function, not one for each conversion: they do not overlap).
+        ctx.scratch()?
     };
     let mut convert = |dest: u32, source: u32, guarded: bool, what: &'static str| -> Result<(), Refused> {
         let mut ops = vec![

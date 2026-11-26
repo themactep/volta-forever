@@ -171,7 +171,16 @@ pub(super) fn parse_function(
     // product, four values made of the lane are computed there too (`kept`), and four
     // registers keep the elements of B that the last product gathered.
     let needs_lane = src.iter().any(|d| is_matrix(d.name));
-    let scratch_need = if needs_lane { MATRIX_SCRATCH } else { 0 };
+    // Turing's F2FP converts its high half in a register of its own (the pool's first one when
+    // the function has a pool), which is placed with the scratch registers.
+    let needs_f2fp_temp = src.iter().any(|d| d.name == "f2fp__RRR" && d.op_or(OP_RA, 255) != 255);
+    let scratch_need = if needs_lane {
+        MATRIX_SCRATCH
+    } else if needs_f2fp_temp && !needs_pool {
+        1
+    } else {
+        0
+    };
     let product_count = src.iter().filter(|d| d.name == "hmma_x8_").count() as u32;
 
     Ok(FuncData {
