@@ -2426,19 +2426,6 @@ class Function:
             moved.append(16 * became[origin][0] + offset % 16)
         return moved
 
-    def without_batch(self, name, word):
-        """`word`, a load the translation changed, with the batch of its original scheduling
-        table cleared: what the translation changed names no batch (its schedule is the
-        translation's). The wait hint of the table (its low five bits) stays."""
-        cls = self.mc.md70.by_name[name]
-        for kind, fields, data in self.mc.d70.plan(cls):
-            if kind == 'table' and data[0] == 'TABLES_opex_0':
-                opex = fields[0].get(word)
-                if opex >> 5:
-                    word = fields[0].put(word, opex & 31)
-                break
-        return word
-
     # ---- return addresses ----------------------------------------------------------------------------------
     def callee_returns_through_lepc(self, flow, target, register):
         """Whether every RET the callee can reach is RET.ABS on `register`, adding 0x20 (the

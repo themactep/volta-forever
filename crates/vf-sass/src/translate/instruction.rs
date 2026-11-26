@@ -485,18 +485,6 @@ pub(super) fn sm70_ldg_without_hints(d: &Decoded) -> Option<u128> {
     sm70_ldg(d, d.op_or(OP_PG, 7), d.op_or(OP_PG_AT_NOT, 0))
 }
 
-/// `word`, a load the translation changed, with the batch of its original scheduling table
-/// cleared: what the translation changed names no batch (its schedule is the translation's).
-/// The wait hint of the table (its low five bits) stays.
-fn without_batch(class_name: &str, d: &Decoded, word: u128) -> Result<u128, Refused> {
-    let table = "TABLES_opex_0(batch_t,usched_info)";
-    let value = d.op_or_name(table, 0);
-    if value >> 5 == 0 {
-        return Ok(word);
-    }
-    put_operand_by_class(class_name, word, table, u64::from(value & 31), false)
-}
-
 /// The same global load as `d` with the given guard, and with the sm_70 cache and scope table.
 fn sm70_ldg(d: &Decoded, pg: u32, pg_not: u32) -> Option<u128> {
     // The source's e, sem, sco and cop are fields 2, 6, 7 and 4 of the sm_75 class (their names
